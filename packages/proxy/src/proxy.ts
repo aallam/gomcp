@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 import { aggregateTools } from "./aggregator.js";
@@ -18,6 +19,10 @@ import type {
 import { isHttpConfig, isStdioConfig } from "./types.js";
 
 type BackendClient = HttpBackendClient | StdioBackendClient;
+type ProxySession = {
+  server: McpServer;
+  transport: StreamableHTTPServerTransport;
+};
 
 /**
  * MCP Proxy — aggregates multiple MCP backends behind a single endpoint.
@@ -139,18 +144,18 @@ export class McpProxy {
         }
       }
 
-      // eslint-disable-next-line sonarjs/deprecation -- server.tool() is the current SDK API
-      server.tool(
+      const inputSchema = z.looseObject(shape);
+
+      server.registerTool(
         tool.name,
-        tool.description ?? "",
-        shape,
-        async (args: Record<string, unknown>) => {
+        {
+          description: tool.description ?? "",
+          inputSchema,
+        },
+        async (args) => {
           const result = await this.callTool(tool.name, args);
           return {
-            content: result.content.map((c) => ({
-              type: c.type as "text",
-              text: c.text ?? JSON.stringify(c),
-            })),
+            content: result.content as CallToolResult["content"],
             isError: result.isError,
           };
         },
@@ -168,12 +173,10 @@ export class McpProxy {
   }): Promise<{ close: () => Promise<void> }> {
     await this.connect();
 
-    const server = this.createServer();
-
     // Use node:http directly to avoid Express dependency
     const { createServer } = await import("node:http");
 
-    const sessions = new Map<string, StreamableHTTPServerTransport>();
+    const sessions = new Map<string, ProxySession>();
 
     // eslint-disable-next-line sonarjs/cognitive-complexity -- HTTP handler requires inherent branching
     const httpServer = createServer(async (req, res) => {
@@ -188,37 +191,48 @@ export class McpProxy {
         const body = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
         const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
-        let transport = sessionId ? sessions.get(sessionId) : undefined;
+        let session = sessionId ? sessions.get(sessionId) : undefined;
 
-        if (!transport) {
-          transport = new StreamableHTTPServerTransport({
+        if (!session) {
+          const sessionServer = this.createServer();
+          const transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => crypto.randomUUID(),
             onsessioninitialized: (id) => {
-              sessions.set(id, transport!);
+              sessions.set(id, { server: sessionServer, transport });
             },
           });
-          await server.connect(transport);
+          session = { server: sessionServer, transport };
+          try {
+            await sessionServer.connect(transport);
+          } catch (error) {
+            await Promise.allSettled([transport.close(), sessionServer.close()]);
+            throw error;
+          }
         }
 
         // Create a minimal ServerResponse-like interface for the transport
-        await transport.handleRequest(req, res, body);
+        await session.transport.handleRequest(req, res, body);
       } else if (url.pathname === "/mcp" && req.method === "GET") {
         const sessionId = req.headers["mcp-session-id"] as string | undefined;
-        const transport = sessionId ? sessions.get(sessionId) : undefined;
+        const session = sessionId ? sessions.get(sessionId) : undefined;
 
-        if (transport) {
-          await transport.handleRequest(req, res);
+        if (session) {
+          await session.transport.handleRequest(req, res);
         } else {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "No session found" }));
         }
       } else if (url.pathname === "/mcp" && req.method === "DELETE") {
         const sessionId = req.headers["mcp-session-id"] as string | undefined;
-        const transport = sessionId ? sessions.get(sessionId) : undefined;
+        const session = sessionId ? sessions.get(sessionId) : undefined;
 
-        if (transport) {
-          await transport.handleRequest(req, res);
+        if (session) {
+          await session.transport.handleRequest(req, res);
           sessions.delete(sessionId!);
+          await Promise.allSettled([
+            session.transport.close(),
+            session.server.close(),
+          ]);
         } else {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "No session found" }));
@@ -238,8 +252,8 @@ export class McpProxy {
 
     return {
       close: async () => {
-        for (const transport of sessions.values()) {
-          await transport.close();
+        for (const session of sessions.values()) {
+          await Promise.allSettled([session.transport.close(), session.server.close()]);
         }
         sessions.clear();
         await this.close();
