@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => {
   const backendInstances = new Map<string, MockHttpBackendClient>();
   const mcpServerInstances: MockMcpServer[] = [];
   const nodeHttpServerInstances: MockNodeHttpServer[] = [];
+  const transportInstances: MockStreamableHTTPServerTransport[] = [];
 
   class MockMcpServer {
     readonly registeredTools = new Map<string, RegisteredTool>();
@@ -73,7 +74,9 @@ const mocks = vi.hoisted(() => {
         sessionIdGenerator?: () => string;
         onsessioninitialized?: (id: string) => void;
       },
-    ) {}
+    ) {
+      transportInstances.push(this);
+    }
 
     async handleRequest(
       _req: unknown,
@@ -135,12 +138,15 @@ const mocks = vi.hoisted(() => {
       path: string;
       headers?: Record<string, string>;
       body?: unknown;
+      rawChunks?: Buffer[];
     }): Promise<{
       statusCode: number;
       headers: Record<string, string>;
       body: string;
     }> {
-      const chunks = opts.body ? [Buffer.from(JSON.stringify(opts.body))] : [];
+      const chunks =
+        opts.rawChunks ??
+        (opts.body !== undefined ? [Buffer.from(JSON.stringify(opts.body))] : []);
       const req = {
         url: opts.path,
         method: opts.method,
@@ -177,6 +183,7 @@ const mocks = vi.hoisted(() => {
   class MockHttpBackendClient {
     connected = false;
     callToolCalls: Array<[string, Record<string, unknown>]> = [];
+    throwOnCallTool: Error | undefined;
 
     constructor(
       private readonly name: string,
@@ -223,6 +230,9 @@ const mocks = vi.hoisted(() => {
       isError?: boolean;
     }> {
       this.callToolCalls.push([toolName, args]);
+      if (this.throwOnCallTool) {
+        throw this.throwOnCallTool;
+      }
 
       if (toolName === "image_tool") {
         return {
@@ -254,6 +264,7 @@ const mocks = vi.hoisted(() => {
     backendInstances,
     mcpServerInstances,
     nodeHttpServerInstances,
+    transportInstances,
     MockHttpBackendClient,
     MockMcpServer,
     MockNodeHttpServer,
@@ -292,6 +303,7 @@ describe("McpProxy runtime correctness", () => {
     mocks.backendInstances.clear();
     mocks.mcpServerInstances.length = 0;
     mocks.nodeHttpServerInstances.length = 0;
+    mocks.transportInstances.length = 0;
 
     proxy = new McpProxy({
       servers: {
@@ -365,6 +377,91 @@ describe("McpProxy runtime correctness", () => {
     }
   });
 
+  it("returns 400 for malformed JSON request bodies", async () => {
+    const listener = await proxy.listen({ port: 3777 });
+
+    try {
+      const httpServer = mocks.nodeHttpServerInstances[0];
+      expect(httpServer).toBeDefined();
+
+      const response = await httpServer!.request({
+        method: "POST",
+        path: "/mcp",
+        headers: { "content-type": "application/json" },
+        rawChunks: [Buffer.from("{ malformed json")],
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(JSON.parse(response.body)).toEqual({ error: "Invalid JSON body" });
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("returns 413 for oversized request bodies", async () => {
+    const listener = await proxy.listen({ port: 3777 });
+
+    try {
+      const httpServer = mocks.nodeHttpServerInstances[0];
+      expect(httpServer).toBeDefined();
+
+      const response = await httpServer!.request({
+        method: "POST",
+        path: "/mcp",
+        headers: { "content-type": "application/json" },
+        rawChunks: [Buffer.alloc(4 * 1024 * 1024 + 1, "x")],
+      });
+
+      expect(response.statusCode).toBe(413);
+      expect(JSON.parse(response.body)).toEqual({ error: "Request body too large" });
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("removes a session when the transport closes", async () => {
+    const listener = await proxy.listen({ port: 3777 });
+
+    try {
+      const httpServer = mocks.nodeHttpServerInstances[0];
+      expect(httpServer).toBeDefined();
+
+      await httpServer!.request({
+        method: "POST",
+        path: "/mcp",
+        headers: { "content-type": "application/json" },
+        body: {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-06-18",
+            capabilities: {},
+            clientInfo: { name: "test-client", version: "1.0.0" },
+          },
+        },
+      });
+
+      const firstTransport = mocks.transportInstances[0];
+      expect(firstTransport).toBeDefined();
+      const sessionId = firstTransport!.sessionId;
+      expect(sessionId).toBeDefined();
+
+      await firstTransport!.close();
+
+      const response = await httpServer!.request({
+        method: "GET",
+        path: "/mcp",
+        headers: { "mcp-session-id": sessionId! },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(JSON.parse(response.body)).toEqual({ error: "No session found" });
+    } finally {
+      await listener.close();
+    }
+  });
+
   it("preserves dynamic tool arguments when invoking the backend", async () => {
     proxy.createServer();
 
@@ -409,5 +506,26 @@ describe("McpProxy runtime correctness", () => {
         mimeType: "image/png",
       },
     ]);
+  });
+
+  it("returns a structured MCP error when backend call fails", async () => {
+    const backend = mocks.backendInstances.get("backend");
+    expect(backend).toBeDefined();
+    backend!.throwOnCallTool = new Error("boom");
+
+    proxy.createServer();
+    const server = mocks.mcpServerInstances[0];
+    expect(server).toBeDefined();
+    const dynamicTool = server!.registeredTools.get("dynamic_tool");
+    expect(dynamicTool).toBeDefined();
+
+    const result = (await dynamicTool!.invoke({ query: "test" })) as {
+      content: Array<Record<string, unknown>>;
+      isError?: boolean;
+    };
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.type).toBe("text");
+    expect(result.content[0]?.text).toContain("Backend error: boom");
   });
 });

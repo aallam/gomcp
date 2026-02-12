@@ -23,6 +23,12 @@ type ProxySession = {
   server: McpServer;
   transport: StreamableHTTPServerTransport;
 };
+const MAX_BODY_BYTES = 4 * 1024 * 1024; // 4MB
+
+function extractErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  return String(error);
+}
 
 /**
  * MCP Proxy — aggregates multiple MCP backends behind a single endpoint.
@@ -117,8 +123,17 @@ export class McpProxy {
     };
 
     return executeMiddlewareChain(this.middleware, ctx, async () => {
-      const result = await backend.callTool(ctx.toolName, ctx.arguments);
-      return result as MiddlewareResult;
+      try {
+        const result = await backend.callTool(ctx.toolName, ctx.arguments);
+        return result as MiddlewareResult;
+      } catch (error) {
+        return {
+          content: [
+            { type: "text", text: `Backend error: ${extractErrorMessage(error)}` },
+          ],
+          isError: true,
+        };
+      }
     });
   }
 
@@ -177,72 +192,120 @@ export class McpProxy {
     const { createServer } = await import("node:http");
 
     const sessions = new Map<string, ProxySession>();
+    const jsonHeaders = { "Content-Type": "application/json" };
+    const sendJson = (
+      res: {
+        headersSent?: boolean;
+        writableEnded: boolean;
+        writeHead: (statusCode: number, headers: Record<string, string>) => void;
+        end: (body?: string) => void;
+      },
+      statusCode: number,
+      body: Record<string, unknown>,
+    ): void => {
+      if (res.writableEnded) return;
+      if (!res.headersSent) {
+        res.writeHead(statusCode, jsonHeaders);
+      }
+      res.end(JSON.stringify(body));
+    };
+    const removeSessionByTransport = (
+      transport: StreamableHTTPServerTransport,
+    ): void => {
+      for (const [id, session] of sessions.entries()) {
+        if (session.transport === transport) {
+          sessions.delete(id);
+          break;
+        }
+      }
+    };
 
     // eslint-disable-next-line sonarjs/cognitive-complexity -- HTTP handler requires inherent branching
     const httpServer = createServer(async (req, res) => {
-      const url = new URL(req.url ?? "/", `http://localhost:${opts.port}`);
+      try {
+        const url = new URL(req.url ?? "/", `http://localhost:${opts.port}`);
 
-      if (url.pathname === "/mcp" && req.method === "POST") {
-        // Read and parse request body
-        const chunks: Buffer[] = [];
-        for await (const chunk of req) {
-          chunks.push(chunk as Buffer);
-        }
-        const body = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
-        const sessionId = req.headers["mcp-session-id"] as string | undefined;
-
-        let session = sessionId ? sessions.get(sessionId) : undefined;
-
-        if (!session) {
-          const sessionServer = this.createServer();
-          const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => crypto.randomUUID(),
-            onsessioninitialized: (id) => {
-              sessions.set(id, { server: sessionServer, transport });
-            },
-          });
-          session = { server: sessionServer, transport };
-          try {
-            await sessionServer.connect(transport);
-          } catch (error) {
-            await Promise.allSettled([transport.close(), sessionServer.close()]);
-            throw error;
+        if (url.pathname === "/mcp" && req.method === "POST") {
+          // Read and parse request body
+          const chunks: Buffer[] = [];
+          let totalBytes = 0;
+          for await (const chunk of req) {
+            const chunkBuffer = Buffer.isBuffer(chunk)
+              ? chunk
+              : Buffer.from(chunk);
+            totalBytes += chunkBuffer.length;
+            if (totalBytes > MAX_BODY_BYTES) {
+              sendJson(res, 413, { error: "Request body too large" });
+              return;
+            }
+            chunks.push(chunkBuffer);
           }
-        }
 
-        // Create a minimal ServerResponse-like interface for the transport
-        await session.transport.handleRequest(req, res, body);
-      } else if (url.pathname === "/mcp" && req.method === "GET") {
-        const sessionId = req.headers["mcp-session-id"] as string | undefined;
-        const session = sessionId ? sessions.get(sessionId) : undefined;
+          let body: unknown;
+          try {
+            body = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
 
-        if (session) {
-          await session.transport.handleRequest(req, res);
+          const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+          let session = sessionId ? sessions.get(sessionId) : undefined;
+
+          if (!session) {
+            const sessionServer = this.createServer();
+            const transport = new StreamableHTTPServerTransport({
+              sessionIdGenerator: () => crypto.randomUUID(),
+              onsessioninitialized: (id) => {
+                sessions.set(id, { server: sessionServer, transport });
+              },
+            });
+            transport.onclose = () => {
+              removeSessionByTransport(transport);
+            };
+            session = { server: sessionServer, transport };
+            try {
+              await sessionServer.connect(transport);
+            } catch (error) {
+              await Promise.allSettled([transport.close(), sessionServer.close()]);
+              throw error;
+            }
+          }
+
+          // Create a minimal ServerResponse-like interface for the transport
+          await session.transport.handleRequest(req, res, body);
+        } else if (url.pathname === "/mcp" && req.method === "GET") {
+          const sessionId = req.headers["mcp-session-id"] as string | undefined;
+          const session = sessionId ? sessions.get(sessionId) : undefined;
+
+          if (session) {
+            await session.transport.handleRequest(req, res);
+          } else {
+            sendJson(res, 400, { error: "No session found" });
+          }
+        } else if (url.pathname === "/mcp" && req.method === "DELETE") {
+          const sessionId = req.headers["mcp-session-id"] as string | undefined;
+          const session = sessionId ? sessions.get(sessionId) : undefined;
+
+          if (session) {
+            await session.transport.handleRequest(req, res);
+            sessions.delete(sessionId!);
+            await Promise.allSettled([
+              session.transport.close(),
+              session.server.close(),
+            ]);
+          } else {
+            sendJson(res, 400, { error: "No session found" });
+          }
+        } else if (url.pathname === "/health") {
+          sendJson(res, 200, { status: "ok" });
         } else {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "No session found" }));
+          res.writeHead(404);
+          res.end();
         }
-      } else if (url.pathname === "/mcp" && req.method === "DELETE") {
-        const sessionId = req.headers["mcp-session-id"] as string | undefined;
-        const session = sessionId ? sessions.get(sessionId) : undefined;
-
-        if (session) {
-          await session.transport.handleRequest(req, res);
-          sessions.delete(sessionId!);
-          await Promise.allSettled([
-            session.transport.close(),
-            session.server.close(),
-          ]);
-        } else {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "No session found" }));
-        }
-      } else if (url.pathname === "/health") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "ok" }));
-      } else {
-        res.writeHead(404);
-        res.end();
+      } catch {
+        sendJson(res, 500, { error: "Internal server error" });
       }
     });
 
